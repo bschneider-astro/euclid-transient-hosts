@@ -3,6 +3,8 @@ import os
 import sys
 import logging
 import datetime
+import shutil
+from io import StringIO
 
 import numpy as np
 from astropy.table import Table, join, vstack
@@ -26,6 +28,10 @@ logger.handlers.clear()
 logger.propagate = False
 logger = logging.getLogger(__name__)
 
+log_buffer = StringIO()
+buffer_handler = logging.StreamHandler(log_buffer)
+buffer_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(buffer_handler)
 
 # =========================
 # Argument parsing
@@ -80,6 +86,11 @@ def parse_args():
         "--outpath",
         default="../data/cutouts/",
         help="Output directory (default: ../data/cutouts/)."
+    )
+    parser.add_argument(
+        "--ext",
+        default="",
+        help="Extension to append to output dir (default: '')."
     )
     parser.add_argument(
         "--credentials-file",
@@ -139,6 +150,7 @@ def build_targets_from_single(name, ra, dec, err):
         names=("name", "right_ascension", "declination", "pos_error")
     )
     target["target_oid"] = np.arange(1, len(target) + 1)
+    target["euclid_input_id"] = np.arange(1, len(target) + 1)
     return target
 
 
@@ -162,7 +174,11 @@ def build_targets_from_csv(csv_path):
     target["right_ascension"] = tab["ra"]
     target["declination"] = tab["dec"]
     target["pos_error"] = tab["err"]
-    target["target_oid"] = np.arange(1, len(target) + 1)
+    if "id" in tab.colnames and len(np.unique(tab["id"])) == len(tab):
+        target["target_oid"] = tab["id"]
+    else:
+        target["target_oid"] = np.arange(1, len(target) + 1)
+    target["euclid_input_id"] = np.arange(1, len(target) + 1)
 
     logger.info(f"Loaded {len(target)} targets from CSV.")
     return target
@@ -173,7 +189,7 @@ def build_targets_from_csv(csv_path):
 # =========================
 def upload_sources_table(Euclid, user_name, target, tab_name="target"):
     tab_user = f"user_{user_name}.{tab_name}"
-    sources_table = target[["right_ascension", "declination"]]
+    sources_table = target[["euclid_input_id", "right_ascension", "declination"]]
 
     try:
         Euclid.delete_user_table(table_name=tab_user)
@@ -188,10 +204,15 @@ def upload_sources_table(Euclid, user_name, target, tab_name="target"):
 # =========================
 # Euclid query logic
 # =========================
-def normalize(joined, prefix, final_name):
+def normalize(joined, prefix, final_name, preferred_suffix=None):
     candidates = [c for c in joined.colnames if c.startswith(prefix)]
 
-    if final_name in candidates:
+    preferred = f"{final_name}{preferred_suffix}" if preferred_suffix else None
+    if preferred in candidates:
+        keep = preferred
+        joined.rename_column(keep, final_name)
+        keep = final_name
+    elif final_name in candidates:
         keep = final_name
     elif candidates:
         keep = candidates[0]
@@ -252,10 +273,20 @@ def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
         logger.error(f"Unsupported frame_type {frame_type}")
         return None, None
 
-    joined = join(tab, target, keys="target_oid", join_type="inner")
+    if "euclid_input_id" not in tab.colnames:
+        logger.error(
+            "Archive result is missing 'euclid_input_id'. "
+            "The uploaded source table must include this stable join key."
+        )
+        return None, None
 
-    normalize(joined, "right_ascension", "right_ascension")
-    normalize(joined, "declination", "declination")
+    if "target_oid" in tab.colnames:
+        tab.rename_column("target_oid", "archive_target_oid")
+
+    joined = join(tab, target, keys="euclid_input_id", join_type="inner")
+
+    normalize(joined, "right_ascension", "right_ascension", preferred_suffix="_2")
+    normalize(joined, "declination", "declination", preferred_suffix="_2")
 
     base = ["target_oid", "name", "right_ascension", "declination", "pos_error"]
     extras = [c for c in joined.colnames if c not in base]
@@ -263,7 +294,7 @@ def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
 
     os.makedirs(outpath, exist_ok=True)
 
-    out_full = os.path.join(outpath, f"euclid_query_{frame_type}_{dtime_str}.csv")
+    out_full = os.path.join(outpath, f"{dtime_str}_euclid_query_{frame_type}.csv")
     joined.write(out_full, format="csv", overwrite=True)
     logger.info(f"Full query saved to {out_full}")
 
@@ -273,7 +304,7 @@ def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
     logger.info("Found %d targets.", len(target_found))
     target_found = target_found[["name", "right_ascension", "declination", "pos_error"]]
 
-    out_summary = os.path.join(outpath, f"euclid_targets_{frame_type}_{dtime_str}.csv")
+    out_summary = os.path.join(outpath, f"{dtime_str}_euclid_targets_{frame_type}.csv")
     target_found.write(out_summary, format="csv", overwrite=True)
     logger.info(f"Found targets saved to {out_summary}")
 
@@ -299,7 +330,10 @@ def main():
 
     Euclid, user_name = login_euclid(args.env, args.credentials_file)
 
-    outpath = args.outpath
+    if args.ext != '':
+        outpath = os.path.join(args.outpath, dtime_str + "_" + args.ext)
+    else:
+        outpath = os.path.join(args.outpath, dtime_str)
     logger.info(f"Using output path: {outpath}")
 
     upload_sources_table(Euclid, user_name, target, tab_name="target")
@@ -324,6 +358,13 @@ def main():
     if joined is None:
         logger.warning("No results found. Nothing written.")
         sys.exit(0)
+    else:
+        with open(os.path.join(outpath, f"{dtime_str}.log"), "w") as f:
+            f.write(log_buffer.getvalue())
+
+        if not args.single:
+            shutil.copy(args.csv, outpath)
+            logger.info(f"Copied input csv {args.csv} to output path {outpath}")
 
     logger.info("Script finished successfully.")
 

@@ -24,7 +24,12 @@ def set_env(envname):
 def chooseBestFile(df_res_dup, radec_colnames):
     """Choosing best file for sources with multiple by checking where the source is closest to image centre"""
     
-    min_dist_per_plotcode = df_res_dup.groupby([radec_colnames["ra_colname"], 'filter_name'], as_index=False, sort=False)['dist'].idxmin()
+    if "euclid_input_id" in df_res_dup.columns:
+        group_cols = ["euclid_input_id", "filter_name"]
+    else:
+        group_cols = [radec_colnames["ra_colname"], radec_colnames["dec_colname"], "filter_name"]
+
+    min_dist_per_plotcode = df_res_dup.groupby(group_cols, as_index=False, sort=False)['dist'].idxmin()
     df_final = df_res_dup.loc[min_dist_per_plotcode["dist"]]
     return df_final
 
@@ -89,7 +94,7 @@ def getFilesStack(source_query, instrument_name, nisp_filters, searchdist, radec
     
     query= f"""SELECT sources.*, frames.file_name, frames.file_path, frames.datalabs_path, frames.instrument_name, frames.filter_name, frames.observation_id, frames.ra AS image_ra, frames.dec AS image_dec, DISTANCE(frames.ra, frames.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
     FROM {source_query} as sources
-    JOIN dr1.observation_stack AS frames
+    JOIN sedm.observation_stack AS frames
     ON (frames.instrument_name='{instrument_name}') AND (frames.fov IS NOT NULL AND CONTAINS(CIRCLE(sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}, {searchdist/60}), frames.fov)=1)
     WHERE frames.datalabs_path IS NOT NULL"""
 

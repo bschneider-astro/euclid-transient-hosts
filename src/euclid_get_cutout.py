@@ -4,6 +4,8 @@ import sys
 import logging
 import math
 import csv
+import shutil
+from io import StringIO
 import numpy as np
 from astropy.table import Table
 from astropy.io import fits
@@ -23,6 +25,11 @@ logger = logging.getLogger("astroquery")
 logger.handlers.clear()
 logger.propagate = False
 logger = logging.getLogger(__name__)
+
+log_buffer = StringIO()
+buffer_handler = logging.StreamHandler(log_buffer)
+buffer_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(buffer_handler)
 
 # =========================
 # Argument parsing

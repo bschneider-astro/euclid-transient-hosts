@@ -44,6 +44,16 @@ python euclid_get_cutout.py \
   --outpath ../test/cutouts/
 ```
 
+## Getting catalogs
+```
+python euclid_get_catalog.py \
+  --csv ../test/cutouts/20260430_211719_euclid_query_stacked_frame.csv \
+  --env IDR \
+  --radius-arcsec 30 \
+  --catalog-table mer_catalogue_deep \
+  --outpath ../test/catalogs/
+```
+
 ## Plotting cutout
 
 ### For stacked frames
