@@ -119,6 +119,68 @@ def build_file_dict(cutout_folder):
     return result
 
 
+def read_primary_header(fp):
+    """
+    Return the primary header for a usable FITS file, or None if the file is
+    empty/corrupt.
+    """
+    if not os.path.isfile(fp) or os.path.getsize(fp) == 0:
+        logger.warning(f"Skipping empty FITS file: {fp}")
+        return None
+
+    try:
+        with fits.open(fp) as hdul:
+            return hdul[0].header.copy()
+    except OSError as exc:
+        logger.warning(f"Skipping unreadable FITS file: {fp} ({exc})")
+        return None
+
+
+def read_primary_data_wcs(fp):
+    """
+    Return primary data and WCS for a usable FITS file, or (None, None) if the
+    file is empty/corrupt.
+    """
+    if not os.path.isfile(fp) or os.path.getsize(fp) == 0:
+        logger.warning(f"Skipping empty FITS file: {fp}")
+        return None, None
+
+    try:
+        with fits.open(fp) as hdul:
+            return hdul[0].data, WCS(hdul[0].header)
+    except OSError as exc:
+        logger.warning(f"Skipping unreadable FITS file: {fp} ({exc})")
+        return None, None
+
+
+def target_in_footprint(fp, hdr):
+    """
+    Return True if the target position (RA_TARG/DEC_TARG) falls inside the
+    image according to the file's WCS. Guards against cutouts returned with a
+    wrong or broken WCS (e.g. a header pointing at a different sky position),
+    which otherwise make aplpy's recenter() fail with NaN/Inf axis limits.
+    Files without target keywords are kept.
+    """
+    ra, dec = hdr.get("RA_TARG"), hdr.get("DEC_TARG")
+    if ra is None or dec is None:
+        return True
+    nx, ny = hdr.get("NAXIS1"), hdr.get("NAXIS2")
+    try:
+        w = WCS(hdr).celestial
+        x, y = w.all_world2pix(float(ra), float(dec), 0)
+    except Exception as exc:
+        logger.warning(f"Skipping {os.path.basename(fp)}: cannot evaluate WCS ({exc})")
+        return False
+    if not (np.isfinite(x) and np.isfinite(y) and nx and ny
+            and -0.5 <= x <= nx - 0.5 and -0.5 <= y <= ny - 0.5):
+        logger.warning(
+            f"Skipping {os.path.basename(fp)}: target ({ra:.6f}, {dec:.6f}) not inside "
+            f"cutout ({nx}x{ny} px, CRVAL=({hdr.get('CRVAL1')}, {hdr.get('CRVAL2')})); "
+            f"pixel position = ({x}, {y}). Bad WCS from the cutout service?"
+        )
+        return False
+    return True
+
 def plot_target_cutouts(grb, files, args, plots_dir, order):
     """
     Plot all cutouts for a single target (GRB or source),
@@ -134,8 +196,11 @@ def plot_target_cutouts(grb, files, args, plots_dir, order):
 
     band_files = {}
     for fp in files:
-        with fits.open(fp) as hdul:
-            hdr = hdul[0].header
+        hdr = read_primary_header(fp)
+        if hdr is None:
+            continue
+        if not target_in_footprint(fp, hdr):
+            continue
 
         inst = (hdr.get("INSTRUME") or "").upper()
         filt = (hdr.get("FILTER") or ("VIS" if inst == "VIS" else "")).upper()
@@ -160,8 +225,10 @@ def plot_target_cutouts(grb, files, args, plots_dir, order):
     meta_fp = band_files[meta_band]
     outdir = os.path.dirname(meta_fp)
 
-    with fits.open(meta_fp) as hdul0:
-        hdr0 = hdul0[0].header
+    hdr0 = read_primary_header(meta_fp)
+    if hdr0 is None:
+        logger.warning(f"No valid metadata FITS file found for {grb}, skipping.")
+        return
 
     name = hdr0.get("OBJECT")
     redshift = hdr0.get("REDSHIFT")
@@ -207,9 +274,9 @@ def plot_target_cutouts(grb, files, args, plots_dir, order):
         fp = band_files[band]
         band_label = band.replace("NIR_", "NISP ")
 
-        with fits.open(fp) as hdul:
-            data = hdul[0].data
-            wcs = WCS(hdul[0].header)
+        data, wcs = read_primary_data_wcs(fp)
+        if data is None or wcs is None:
+            continue
 
         left = i * (1.0 / n)
         width = 1.0 / n
@@ -301,9 +368,9 @@ def plot_mosaic_row(fig, row_bands, row_index, total_rows, band_files,
     for j, band in enumerate(row_bands):
         fp = band_files[band]
 
-        with fits.open(fp) as hdul:
-            data = hdul[0].data
-            wcs = WCS(hdul[0].header)
+        data, wcs = read_primary_data_wcs(fp)
+        if data is None or wcs is None:
+            continue
 
         width = 1.0 / ncols_row
         left = j * width
@@ -383,8 +450,11 @@ def plot_target_cutouts_mosaic(grb, files, args, plots_dir):
 
     band_files = {}
     for fp in files:
-        with fits.open(fp) as hdul:
-            hdr = hdul[0].header
+        hdr = read_primary_header(fp)
+        if hdr is None:
+            continue
+        if not target_in_footprint(fp, hdr):
+            continue
 
         inst = (hdr.get("INSTRUME") or "").upper()
         filt = (hdr.get("FILTER") or "").upper()
@@ -441,8 +511,10 @@ def plot_target_cutouts_mosaic(grb, files, args, plots_dir):
     meta_fp = band_files[meta_band]
     outdir = os.path.dirname(meta_fp)
 
-    with fits.open(meta_fp) as hdul0:
-        hdr0 = hdul0[0].header
+    hdr0 = read_primary_header(meta_fp)
+    if hdr0 is None:
+        logger.warning(f"No valid metadata FITS file found for {grb}, skipping.")
+        return
 
     name = hdr0.get("OBJECT")
     redshift = hdr0.get("REDSHIFT")

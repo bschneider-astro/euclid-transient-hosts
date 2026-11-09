@@ -13,10 +13,36 @@ import re
 
 
 #choosing environment
+# schema holding mosaic_product / calibrated_frame / observation_stack per environment
+# (OTF has no dr1 schema; sedm exists in every environment)
+SCHEMAS = {"IDR": "dr1", "OTF": "sedm", "REG": "sedm", "PDR": "sedm"}
+
 Euclid = None
-def set_env(envname):
-    global Euclid
-    Euclid = EuclidClass(environment=envname)
+schema = "sedm"
+_logged_in = False
+
+def set_env(envname, euclid=None):
+    """Select the archive environment. Pass an already logged-in EuclidClass as euclid to reuse its session."""
+    global Euclid, schema, _logged_in
+    Euclid = euclid if euclid is not None else EuclidClass(environment=envname)
+    schema = SCHEMAS.get(envname, "sedm")
+    _logged_in = euclid is not None
+
+
+def _pathFilter(alias, require_datalabs):
+    """WHERE clause keeping files with a usable path (datalabs_path is empty off-Datalabs, e.g. on OTF)"""
+    path_col = "datalabs_path" if require_datalabs else "file_path"
+    return f"{alias}.{path_col} IS NOT NULL"
+
+
+def _runQuery(query):
+    """Run an archive query and return a pandas dataframe, raising if the query itself failed"""
+    job = Euclid.launch_job_async(query, verbose=False)
+    if job is None:
+        raise RuntimeError("Query for files failed. Check that the tables exist in this environment "
+                           "and that the source table has 'right_ascension'/'declination' or 'ra'/'dec' columns.\n"
+                           f"Query was:\n{query}")
+    return job.get_results().to_pandas()
 
 
 ###################################### Functions for matching the sources with files ######################################
@@ -65,50 +91,40 @@ def checkColnames(source_query):
     return getRaDecColnames(all_colnames)
 
 
-def getFilesCalib(source_query, instrument_name, nisp_filters, searchdist, radec_colnames):
+def getFilesCalib(source_query, instrument_name, nisp_filters, searchdist, radec_colnames, require_datalabs=False):
     """Match sources with calibrated files by checking if file fov contains source"""
     
     query= f"""SELECT sources.*, frames.file_name, frames.file_path, frames.datalabs_path, frames.instrument_name, frames.filter_name, frames.observation_id, frames.ra AS image_ra, frames.dec AS image_dec, DISTANCE(frames.ra, frames.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
     FROM {source_query} as sources
-    JOIN dr1.calibrated_frame AS frames
+    JOIN {schema}.calibrated_frame AS frames
     ON (frames.instrument_name='{instrument_name}') AND (frames.fov IS NOT NULL AND CONTAINS(CIRCLE(sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}, {searchdist/60}), frames.fov)=1)
-    WHERE frames.datalabs_path IS NOT NULL"""
+    WHERE {_pathFilter("frames", require_datalabs)}"""
 
     #modify query to include only the provided nisp filters
     if instrument_name == 'NISP' and len(nisp_filters) > 0 and len(nisp_filters) < 3:
         query = addFilters("frames", query, instrument_name, nisp_filters)
         
     #make query to get file info
-    job = Euclid.launch_job_async(query, verbose=False)
-    
-    if job == None:
-        raise AttributeError("Query for files failed. Please make sure your source query or user table contains columns named 'right_ascension' and 'declination' or 'ra' and 'dec'. When using a source query it should have brackets around it.")
-        
-    df_res = job.get_results().to_pandas()
+    df_res = _runQuery(query)
     print("Found", len(df_res), "query results")
     
     return df_res
 
-def getFilesStack(source_query, instrument_name, nisp_filters, searchdist, radec_colnames, logger=None):
+def getFilesStack(source_query, instrument_name, nisp_filters, searchdist, radec_colnames, logger=None, require_datalabs=False):
     """Match sources with stacked frames by checking if file fov contains source"""
     
     query= f"""SELECT sources.*, frames.file_name, frames.file_path, frames.datalabs_path, frames.instrument_name, frames.filter_name, frames.observation_id, frames.ra AS image_ra, frames.dec AS image_dec, DISTANCE(frames.ra, frames.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
     FROM {source_query} as sources
-    JOIN sedm.observation_stack AS frames
+    JOIN {schema}.observation_stack AS frames
     ON (frames.instrument_name='{instrument_name}') AND (frames.fov IS NOT NULL AND CONTAINS(CIRCLE(sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}, {searchdist/60}), frames.fov)=1)
-    WHERE frames.datalabs_path IS NOT NULL"""
+    WHERE {_pathFilter("frames", require_datalabs)}"""
 
     #modify query to include only the provided nisp filters
     if instrument_name == 'NISP' and len(nisp_filters) > 0 and len(nisp_filters) < 3:
         query = addFilters("frames", query, instrument_name, nisp_filters)
         
     #make query to get file info
-    job = Euclid.launch_job_async(query, verbose=False)
-    
-    if job == None:
-        raise AttributeError("Query for files failed. Please make sure your source query or user table contains columns named 'right_ascension' and 'declination' or 'ra' and 'dec'. When using a source query it should have brackets around it.")
-        
-    df_res_dup = job.get_results().to_pandas()
+    df_res_dup = _runQuery(query)
     df_res = chooseBestFile(df_res_dup, radec_colnames)
     if logger is not None:
         logger.info(f"Found {len(df_res)} stacks for instrument {instrument_name}")
@@ -117,73 +133,59 @@ def getFilesStack(source_query, instrument_name, nisp_filters, searchdist, radec
     return df_res
     
     
-def getFilesMosaic(source_query, instrument_name, nisp_filters, radec_colnames):
+def getFilesMosaic(source_query, instrument_name, nisp_filters, radec_colnames, require_datalabs=False):
     """Match sources with mosaic files by checking if file tile_index matches the first 9 digits of source's segmentation_map_id"""
     
     query= f"""SELECT sources.*, mosaics.file_name, mosaics.file_path, mosaics.datalabs_path, mosaics.mosaic_product_oid, mosaics.tile_index, mosaics.instrument_name, mosaics.filter_name, mosaics.ra AS image_ra, mosaics.dec AS image_dec, DISTANCE(mosaics.ra, mosaics.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
         FROM {source_query} as sources
-        JOIN dr1.mosaic_product AS mosaics
+        JOIN {schema}.mosaic_product AS mosaics
         ON (mosaics.instrument_name='{instrument_name}') AND (CAST(mosaics.tile_index AS CHAR(25)) = SUBSTRING(CAST(segmentation_map_id AS CHAR(25)), 1, 9))
-        WHERE mosaics.datalabs_path IS NOT NULL"""
+        WHERE {_pathFilter("mosaics", require_datalabs)}"""
 
     #modify query to include only the provided nisp filters
     if instrument_name == 'NISP' and len(nisp_filters) > 0 and len(nisp_filters) < 3:
         query = addFilters("mosaics", query, instrument_name, nisp_filters)
         
     #make query to get file info
-    job = Euclid.launch_job_async(query, verbose=False)
-    
-    if job == None:
-        raise AttributeError("Query for files failed. Please make sure your source query or user table contains columns named 'right_ascension' and 'declination' or 'ra' and 'dec'. When using a source query it should have brackets around it.")
-    
-    df_res = job.get_results().to_pandas()
+    df_res = _runQuery(query)
     print("Found", len(df_res), "query results")
     
     return df_res
 
 
-def getFilesMosaicBackup(source_query, instrument_name, nisp_filters, searchdist, radec_colnames):
+def getFilesMosaicBackup(source_query, instrument_name, nisp_filters, searchdist, radec_colnames, require_datalabs=False):
     """Match sources with mosaic files by checking if file fov contains source"""
     
     query= f"""SELECT sources.*, mosaics.file_name, mosaics.file_path, mosaics.datalabs_path, mosaics.mosaic_product_oid, mosaics.tile_index, mosaics.instrument_name, mosaics.filter_name, mosaics.ra AS image_ra, mosaics.dec AS image_dec, DISTANCE(mosaics.ra, mosaics.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
         FROM {source_query} as sources
-        JOIN dr1.mosaic_product AS mosaics
+        JOIN {schema}.mosaic_product AS mosaics
         ON (mosaics.instrument_name='{instrument_name}') AND (mosaics.fov IS NOT NULL AND CONTAINS(CIRCLE(sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}, {searchdist/60}), mosaics.fov)=1)
-        WHERE mosaics.datalabs_path IS NOT NULL"""
+        WHERE {_pathFilter("mosaics", require_datalabs)}"""
 
     #modify query to include only the provided nisp filters
     if instrument_name == 'NISP' and len(nisp_filters) > 0 and len(nisp_filters) < 3:
         query = addFilters("mosaics", query, instrument_name, nisp_filters)
     
     #make query to get file info
-    job = Euclid.launch_job_async(query, verbose=False)
-    
-    if job == None:
-        raise AttributeError("Query for files failed. Please make sure your source query or user table contains columns named 'right_ascension' and 'declination' or 'ra' and 'dec'. When using a source query it should have brackets around it.")
-    
-    df_res_dup = job.get_results().to_pandas()
+    df_res_dup = _runQuery(query)
     df_res = chooseBestFile(df_res_dup, radec_colnames)
     print("Found", len(df_res), "query results")
     
     return df_res
 
-def getFilesMosaicAll(source_query, radec_colnames, searchdist, logger=None):
+def getFilesMosaicAll(source_query, radec_colnames, searchdist, logger=None, require_datalabs=False):
     query= f"""SELECT sources.*, mosaics.file_name, mosaics.file_path, mosaics.datalabs_path, mosaics.mosaic_product_oid, mosaics.tile_index, mosaics.instrument_name, mosaics.filter_name, mosaics.ra AS image_ra, mosaics.dec AS image_dec, DISTANCE(mosaics.ra, mosaics.dec, sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}) AS dist
         FROM {source_query} as sources
-        JOIN dr1.mosaic_product AS mosaics
+        JOIN {schema}.mosaic_product AS mosaics
         ON (mosaics.fov IS NOT NULL AND CONTAINS(CIRCLE(sources.{radec_colnames["ra_colname"]}, sources.{radec_colnames["dec_colname"]}, {searchdist/60}), mosaics.fov)=1)
-        WHERE mosaics.datalabs_path IS NOT NULL"""
+        WHERE {_pathFilter("mosaics", require_datalabs)}"""
     
-    job = Euclid.launch_job_async(query, verbose=False)
-    if job == None:
-        raise AttributeError("Query for files failed.")
-    
-    df_res_dup = job.get_results().to_pandas()
+    df_res_dup = _runQuery(query)
     df_res = chooseBestFile(df_res_dup, radec_colnames)
     if logger is not None:
-        logger.info(f"Found {len(df_res)} stacks for instrument.")
+        logger.info(f"Found {len(df_res)} mosaics.")
     else:
-        print(f"Found {len(df_res)} stacks for instrument.")
+        print(f"Found {len(df_res)} mosaics.")
     return df_res
 
 def checkInput(instrument_name, nisp_filters):
@@ -198,7 +200,8 @@ def checkInput(instrument_name, nisp_filters):
             raise ValueError(f"Invalid filter name. Choose from: {valid_filters}")     
     return
 
-def getFiles(product_type, sources, instrument_name = 'VIS', nisp_filters=[], segmentation_map_id = False, searchdist = 0.5, logger=None):
+def getFiles(product_type, sources, instrument_name = 'VIS', nisp_filters=[], segmentation_map_id = False, searchdist = 0.5, logger=None,
+             require_datalabs=False, credentials_file='cred.txt'):
     """Matching sources with files to make cutouts from
     
     Args:
@@ -208,13 +211,18 @@ def getFiles(product_type, sources, instrument_name = 'VIS', nisp_filters=[], se
         nisp_filters (list, optional): list of strings containing any or all of the NISP filter names NIR_H, NIR_J, NIR_Y
         segmentation_map_id (bool, optional): whether the source table has this column (for faster file matching for mosaics, default False)
         logger (logging.Logger, optional): logger for logging information, default None
+        require_datalabs (bool, optional): keep only files with a datalabs_path (needed for makeCutoutsByTile on Datalabs). Default False keeps every file with an archive file_path, as needed off-Datalabs (e.g. OTF has no datalabs_path)
+        credentials_file (str, optional): credentials used to log in if set_env was not given a logged-in EuclidClass, default 'cred.txt'
     """
     
     #checking input value correctness
     checkInput(instrument_name, nisp_filters)
     
-    #archive login for queries
-    Euclid.login(credentials_file = 'cred.txt')
+    #archive login for queries (skipped when set_env was given a logged-in session)
+    global _logged_in
+    if not _logged_in:
+        Euclid.login(credentials_file = credentials_file)
+        _logged_in = True
     
     # check if user table uses columns ra, dec or right_ascension, declination
     if "user_" in sources:
@@ -225,16 +233,16 @@ def getFiles(product_type, sources, instrument_name = 'VIS', nisp_filters=[], se
     #getting the files for sources
     if product_type == "mosaic":
         if segmentation_map_id == True:
-            df = getFilesMosaic(sources, instrument_name, nisp_filters, radec_colnames)
+            df = getFilesMosaic(sources, instrument_name, nisp_filters, radec_colnames, require_datalabs=require_datalabs)
         else:
             print("Using getFilesMosaicBackup method for matching sources with mosaic files")
-            df = getFilesMosaicBackup(sources, instrument_name, nisp_filters, searchdist, radec_colnames)   
+            df = getFilesMosaicBackup(sources, instrument_name, nisp_filters, searchdist, radec_colnames, require_datalabs=require_datalabs)   
     elif product_type == "mosaicAll":     
-        df = getFilesMosaicAll(sources, radec_colnames, searchdist, logger=logger)
+        df = getFilesMosaicAll(sources, radec_colnames, searchdist, logger=logger, require_datalabs=require_datalabs)
     elif product_type == "calibrated_frame":
-        df = getFilesCalib(sources, instrument_name, nisp_filters, searchdist, radec_colnames)
+        df = getFilesCalib(sources, instrument_name, nisp_filters, searchdist, radec_colnames, require_datalabs=require_datalabs)
     elif product_type == "stacked_frame":
-        df = getFilesStack(sources, instrument_name, nisp_filters, searchdist, radec_colnames, logger=logger)
+        df = getFilesStack(sources, instrument_name, nisp_filters, searchdist, radec_colnames, logger=logger, require_datalabs=require_datalabs)
     else:
         raise ValueError(f"Invalid instrument name. Choose from: mosaic, calibrated_frame") 
         

@@ -83,6 +83,12 @@ def parse_args():
         help="NISP filters (e.g. Y J H). Only used for stacked_frame/NISP."
     )
     parser.add_argument(
+        "--require-datalabs",
+        action="store_true",
+        help="Only keep files with a datalabs_path (needed for on-Datalabs cutouts). "
+             "Off by default since e.g. OTF has no datalabs paths."
+    )
+    parser.add_argument(
         "--outpath",
         default="../data/cutouts/",
         help="Output directory (default: ../data/cutouts/)."
@@ -125,7 +131,6 @@ def parse_args():
 def login_euclid(env, credentials_file):
     logger.info(f"Using Euclid environment: {env}")
     Euclid = EuclidClass(environment=env, show_server_messages=False)
-    ut.set_env(env)
 
     if not os.path.exists(credentials_file):
         logger.error(f"Credentials file not found: {credentials_file}")
@@ -133,6 +138,8 @@ def login_euclid(env, credentials_file):
 
     logger.info("Credentials file found. Logging in.")
     Euclid.login(credentials_file=credentials_file, verbose=False)
+    # share this session with cutout_utils so it queries the same environment without logging in again
+    ut.set_env(env, euclid=Euclid)
 
     with open(credentials_file, "r") as f:
         user_name = f.readline().strip()
@@ -227,7 +234,7 @@ def normalize(joined, prefix, final_name, preferred_suffix=None):
 
 
 def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
-                     filters, dtime_str, outpath, user_name):
+                     filters, dtime_str, outpath, user_name, require_datalabs=False):
 
     if frame_type == "stacked_frame":
         logger.info(f"Searching for sources in {frame_type}...")
@@ -245,6 +252,7 @@ def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
                 nisp_filters=filters or [],
                 segmentation_map_id=False,
                 logger=logger,
+                require_datalabs=require_datalabs,
             )
             if df is not None and len(df) > 0:
                 tab_list.append(Table.from_pandas(df))
@@ -263,6 +271,7 @@ def run_euclid_query(Euclid, target, env, frame_type, instrument_names,
             product_type="mosaicAll",
             sources="target",
             logger=logger,
+            require_datalabs=require_datalabs,
         )
         if df is None or len(df) == 0:
             logger.warning("No mosaic results found.")
@@ -353,6 +362,7 @@ def main():
         dtime_str=dtime_str,
         outpath=outpath,
         user_name=user_name,
+        require_datalabs=args.require_datalabs,
     )
 
     if joined is None:
