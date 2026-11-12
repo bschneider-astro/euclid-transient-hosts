@@ -1,16 +1,29 @@
+"""Query Euclid DR1 catalogues for transient host candidates.
+
+For every target in the input CSV, a cone search is run on the deep MER
+catalogues first and on the wide catalogues if nothing is found. The candidate
+hosts are then completed with morphology, photo-z, classification and physical
+parameters. Results are written per target to ``<outdir>/<name>/``:
+
+- ``<name>_catalog.csv``: minimal cone-search result
+- ``<name>_catalog_full.csv``: minimal result merged with the full host data
+"""
+
 import argparse
 import datetime
+import glob
 import logging
 import math
 import os
 import re
-import shutil
 import sys
+import time
 from io import StringIO
+from numbers import Real
 
 import numpy as np
-from astropy.table import Table, vstack
-import astropy.units as u
+import pandas as pd
+from astropy.table import Table
 
 
 # =========================
@@ -30,46 +43,207 @@ buffer_handler.setFormatter(
 logger.addHandler(buffer_handler)
 
 
-CATALOG_COLUMNS = [
-    "object_id",
+# =========================
+# Catalogue definitions
+# =========================
+# DR1 tables exist in several schemas (e.g. catalogue.* and dr1_catalogue_mat_views.*)
+SCHEMA = "catalogue."
+
+HOST_COLUMNS = (
     "right_ascension",
     "declination",
-    "segmentation_map_id",
-    "vis_det",
-    "flux_vis_psf",
-    "fluxerr_vis_psf",
+    "object_id",
+    "det_quality_flag",
     "flux_detection_total",
     "fluxerr_detection_total",
-    "flux_vis_sersic",
-    "flux_y_sersic",
-    "flux_j_sersic",
     "flux_h_sersic",
-    "flag_vis",
-    "flag_y",
-    "flag_j",
-    "flag_h",
-    "variable_flag",
-    "extended_flag",
-    "extended_prob",
-    "det_quality_flag",
+    "segmentation_map_id",
     "segmentation_area",
+    "kron_radius",
+    "ellipticity",
+    "variable_flag",
+    "point_like_prob",
+    "spurious_flag",
     "semimajor_axis",
     "semimajor_axis_err",
     "position_angle",
-    "ellipticity",
-    "ellipticity_err",
-    "kron_radius",
-    "kron_radius_err",
-]
+    "flux_vis_2fwhm_aper",
+    "flux_y_2fwhm_aper",
+    "flux_j_2fwhm_aper",
+    "flux_h_2fwhm_aper",
+    "fluxerr_vis_2fwhm_aper",
+    "fluxerr_y_2fwhm_aper",
+    "fluxerr_j_2fwhm_aper",
+    "fluxerr_h_2fwhm_aper",
+    "vis_det",
+    "flux_nir_stack_2fwhm_aper",
+    "fluxerr_nir_stack_2fwhm_aper",
+    "mumax_minus_mag",
+    "flux_u_ext_decam_2fwhm_aper",
+    "flux_u_ext_lsst_2fwhm_aper",
+    "flux_u_ext_megacam_2fwhm_aper",
+    "fluxerr_u_ext_decam_2fwhm_aper",
+    "fluxerr_u_ext_lsst_2fwhm_aper",
+    "fluxerr_u_ext_megacam_2fwhm_aper",
+    "flux_g_ext_decam_2fwhm_aper",
+    "flux_g_ext_hsc_2fwhm_aper",
+    "flux_g_ext_jpcam_2fwhm_aper",
+    "flux_g_ext_lsst_2fwhm_aper",
+    "fluxerr_g_ext_decam_2fwhm_aper",
+    "fluxerr_g_ext_hsc_2fwhm_aper",
+    "fluxerr_g_ext_jpcam_2fwhm_aper",
+    "fluxerr_g_ext_lsst_2fwhm_aper",
+    "flux_r_ext_decam_2fwhm_aper",
+    "flux_r_ext_lsst_2fwhm_aper",
+    "flux_r_ext_megacam_2fwhm_aper",
+    "fluxerr_r_ext_decam_2fwhm_aper",
+    "fluxerr_r_ext_lsst_2fwhm_aper",
+    "fluxerr_r_ext_megacam_2fwhm_aper",
+    "flux_i_ext_decam_2fwhm_aper",
+    "flux_i_ext_lsst_2fwhm_aper",
+    "flux_i_ext_panstarrs_2fwhm_aper",
+    "fluxerr_i_ext_decam_2fwhm_aper",
+    "fluxerr_i_ext_lsst_2fwhm_aper",
+    "fluxerr_i_ext_panstarrs_2fwhm_aper",
+    "flux_z_ext_decam_2fwhm_aper",
+    "flux_z_ext_hsc_2fwhm_aper",
+    "flux_z_ext_panstarrs_2fwhm_aper",
+    "flux_z_ext_lsst_2fwhm_aper",
+    "fluxerr_z_ext_decam_2fwhm_aper",
+    "fluxerr_z_ext_hsc_2fwhm_aper",
+    "fluxerr_z_ext_panstarrs_2fwhm_aper",
+    "fluxerr_z_ext_lsst_2fwhm_aper",
+)
 
-MORPHOLOGY_COLUMNS = [
-    "sersic_angle",
-    "sersic_angle_err",
-    "moment_20",
-    "moment_20_err",
-    "concentration",
-    "concentration_err",
-]
+COMMON_FILTERS = (
+    "cat.mumax_minus_mag > -2.6",
+    "cat.mu_max < 35",
+)
+
+DEEP_CATALOGS = (
+    {
+        "table": SCHEMA + "mer_catalogue_deep_survey",
+        "morphology_table": SCHEMA + "mer_morphology_deep_survey",
+        "photo_z_table": SCHEMA + "phz_photo_z_deep_survey",
+        "classification_table": SCHEMA + "phz_classification_deep_survey",
+        "physical_table": SCHEMA + "phz_physical_parameters_deep_survey",
+        "survey_tier": "deep",
+        "specific_tier": "deep_survey",
+        "filters": COMMON_FILTERS,
+    },
+    {
+        "table": SCHEMA + "mer_catalogue_deep_mode",
+        "morphology_table": SCHEMA + "mer_morphology_deep_mode",
+        "photo_z_table": SCHEMA + "phz_photo_z_deep_mode",
+        "classification_table": SCHEMA + "phz_classification_deep_mode",
+        "physical_table": SCHEMA + "phz_physical_parameters_deep_mode",
+        "survey_tier": "deep",
+        "specific_tier": "deep_mode",
+        "filters": COMMON_FILTERS,
+    },
+)
+
+WIDE_CATALOGS = (
+    {
+        "table": SCHEMA + "mer_catalogue_wide_mode",
+        "morphology_table": SCHEMA + "mer_morphology_wide_mode",
+        "photo_z_table": (SCHEMA + "phz_photo_z_wide", SCHEMA + "phz_photo_z_wide_survey"),
+        "classification_table": (SCHEMA + "phz_classification_wide", SCHEMA + "phz_classification_wide_survey"),
+        "physical_table": (SCHEMA + "phz_physical_parameters_wide", SCHEMA + "phz_physical_parameters_wide_survey"),
+        "survey_tier": "wide",
+        "specific_tier": "wide_mode",
+        "filters": ("cat.det_quality_flag < 130", *COMMON_FILTERS),
+    },
+    {
+        "table": SCHEMA + "mer_catalogue_wide_survey",
+        "morphology_table": SCHEMA + "mer_morphology_wide_survey",
+        "photo_z_table": (SCHEMA + "phz_photo_z_wide", SCHEMA + "phz_photo_z_wide_survey"),
+        "classification_table": (SCHEMA + "phz_classification_wide", SCHEMA + "phz_classification_wide_survey"),
+        "physical_table": (SCHEMA + "phz_physical_parameters_wide", SCHEMA + "phz_physical_parameters_wide_survey"),
+        "survey_tier": "wide",
+        "specific_tier": "wide_survey",
+        "filters": ("cat.det_quality_flag < 130", *COMMON_FILTERS),
+    },
+)
+
+# Tables joined to the MER catalogue and their ADQL aliases
+JOINED_TABLES = {
+    "morphology_table": "morph",
+    "photo_z_table": "phz",
+    "classification_table": "classification",
+    "physical_table": "phys",
+}
+
+FULL_HOST_COLUMNS = (
+    "cat.object_id",
+    "cat.segmentation_map_id",
+    "cat.segmentation_area",
+    "cat.vis_det",
+    "cat.flux_vis_psf",
+    "cat.fluxerr_vis_psf",
+    "cat.flux_detection_total",
+    "cat.fluxerr_detection_total",
+    "cat.flux_vis_sersic",
+    "cat.flux_y_sersic",
+    "cat.flux_j_sersic",
+    "cat.flux_h_sersic",
+    "cat.flag_vis",
+    "cat.flag_y",
+    "cat.flag_j",
+    "cat.flag_h",
+    "cat.variable_flag",
+    "cat.extended_flag",
+    "cat.extended_prob",
+    "cat.point_like_flag",
+    "cat.point_like_prob",
+    "cat.deblended_flag",
+    "cat.blended_prob",
+    "cat.binary_flag",
+    "cat.det_quality_flag",
+    "cat.fwhm",
+    "cat.semimajor_axis_err",
+    "cat.position_angle",
+    "cat.ellipticity_err",
+    "cat.kron_radius",
+    "cat.kron_radius_err",
+    "cat.gal_ebv",
+    "cat.gal_ebv_err",
+    "cat.flux_h_templfit",
+    "cat.flux_vis_to_h_templfit",
+    "morph.sersic_sersic_vis_radius",
+    "morph.sersic_sersic_vis_radius_err",
+    "morph.sersic_sersic_vis_index",
+    "morph.sersic_sersic_vis_axis_ratio",
+    "morph.sersic_sersic_nir_radius",
+    "morph.sersic_sersic_nir_radius_err",
+    "morph.sersic_sersic_nir_index",
+    "morph.sersic_sersic_nir_axis_ratio",
+    "morph.sersic_visnir_flags",
+    "morph.sersic_visnir_reduced_chi2",
+    "morph.sersic_angle_err",
+    "morph.flux_radius",
+    "morph.flux_radius_err",
+    "morph.moment_20",
+    "morph.moment_20_err",
+    "morph.concentration",
+    "morph.concentration_err",
+    "morph.agn_yes",
+    "morph.peculiar_yes",
+    "morph.dwarf_yes",
+    "morph.major_merger",
+    "phz.phz_median",
+    "phz.phz_classification",
+    "phz.phz_pdf",
+    "phz.phz_weight",
+    "phz.phz_flags",
+    "classification.phz_gal_prob",
+    "classification.phz_star_prob",
+    "classification.phz_qso_prob",
+    "phys.phz_pp_median_sfr",
+    "phys.phz_pp_median_sfhage",
+    "phys.phz_pp_median_stellarmass",
+    "phys.phz_pp_median_stellarmetallicity",
+)
 
 
 # =========================
@@ -78,15 +252,35 @@ MORPHOLOGY_COLUMNS = [
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Query Euclid MER catalog sources around targets from a cutout/query CSV "
-            "and save catalog rows to CSV."
+            "Query Euclid DR1 catalogues (deep first, then wide) around targets "
+            "from a CSV and save minimal and full host catalogues per target."
         )
     )
 
     parser.add_argument(
         "--csv",
         required=True,
-        help="CSV with target coordinates, e.g. output from euclid_query.py.",
+        help=(
+            "CSV with target coordinates, or a folder containing one. For a folder, "
+            "the latest *_euclid_targets_<frame>.csv written by euclid_query.py is "
+            "used, falling back to the latest *_euclid_query_<frame>.csv."
+        ),
+    )
+    parser.add_argument(
+        "--frame-type",
+        default=None,
+        help=(
+            "When --csv is a folder, only consider CSVs for this frame type "
+            "(e.g. stacked_frame, calibrated_frame, mosaic)."
+        ),
+    )
+    parser.add_argument(
+        "--bestpos-csv",
+        default=None,
+        help=(
+            "Optional CSV with improved positions. Rows matching a target name "
+            "override its RA, Dec and positional error."
+        ),
     )
     parser.add_argument(
         "--env",
@@ -100,39 +294,52 @@ def parse_args():
         help="Euclid credentials file (default: ./cred.txt).",
     )
     parser.add_argument(
-        "--outpath",
-        default="../data/catalogs/",
-        help="Base output folder for catalog query products.",
-    )
-    parser.add_argument(
-        "--ext",
-        default="",
-        help="Extension appended to the timestamped output directory.",
+        "--outdir",
+        default=None,
+        help=(
+            "Output folder; per-target catalogues go to <outdir>/<name>/ "
+            "(default: folder of the input CSV)."
+        ),
     )
     parser.add_argument(
         "--name-column",
         default="name",
-        help="Column with target names (default: name).",
+        help="Target name column in --csv (default: name).",
     )
     parser.add_argument(
         "--ra-column",
         default="right_ascension",
-        help="Column with target RA in degrees (default: right_ascension).",
+        help="Target RA column in degrees in --csv (default: right_ascension).",
     )
     parser.add_argument(
         "--dec-column",
         default="declination",
-        help="Column with target Dec in degrees (default: declination).",
+        help="Target Dec column in degrees in --csv (default: declination).",
     )
     parser.add_argument(
         "--err-column",
         default="pos_error",
-        help="Optional column with target positional error in arcsec (default: pos_error).",
+        help="Optional positional error column in --csv (default: pos_error).",
     )
     parser.add_argument(
-        "--target-id-column",
-        default="target_oid",
-        help="Optional stable target id column used for deduplication (default: target_oid).",
+        "--bestpos-name-column",
+        default="name",
+        help="Target name column in --bestpos-csv (default: name).",
+    )
+    parser.add_argument(
+        "--bestpos-ra-column",
+        default="ra",
+        help="RA column in --bestpos-csv (default: ra).",
+    )
+    parser.add_argument(
+        "--bestpos-dec-column",
+        default="dec",
+        help="Dec column in --bestpos-csv (default: dec).",
+    )
+    parser.add_argument(
+        "--bestpos-err-column",
+        default="err",
+        help="Positional error column in --bestpos-csv (default: err).",
     )
     parser.add_argument(
         "--radius-arcsec",
@@ -141,48 +348,26 @@ def parse_args():
         help="Cone-search radius around each target in arcsec (default: 30).",
     )
     parser.add_argument(
-        "--catalog-table",
-        action="append",
-        default=None,
-        help=(
-            "MER catalog table to query. Can be repeated. "
-            "Default: mer_catalogue_deep."
-        ),
-    )
-    parser.add_argument(
-        "--morphology-table",
-        default="none",
-        help=(
-            "MER morphology table to join. Use 'auto' to infer deep/wide, "
-            "or 'none' to skip the morphology join (default: none)."
-        ),
-    )
-    parser.add_argument(
-        "--columns",
-        default="default",
-        choices=["default", "all"],
-        help="Query the default compact column set or all catalog columns.",
-    )
-    parser.add_argument(
-        "--top-n",
+        "--max-retries",
         type=int,
-        default=10,
-        help="Rows to save in each per-target top catalog. Use 0 for all rows.",
+        default=3,
+        help="Maximum number of attempts per archive query (default: 3).",
     )
     parser.add_argument(
-        "--sort-by",
-        default="sep_arcsec",
-        help="Column used to sort outputs when available (default: sep_arcsec).",
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Base delay in seconds between query attempts (default: 5).",
     )
     parser.add_argument(
-        "--no-combined",
+        "--force-catalog",
         action="store_true",
-        help="Do not write the combined catalog across all targets.",
+        help="Re-run the cone search even if <name>_catalog.csv exists.",
     )
     parser.add_argument(
-        "--copy-input",
+        "--force-full",
         action="store_true",
-        help="Copy the input CSV into the output directory.",
+        help="Re-query the full host data even if <name>_catalog_full.csv exists.",
     )
     parser.add_argument(
         "--log-level",
@@ -206,20 +391,13 @@ def login_euclid(env, credentials_file):
             "Install it in the active environment before running catalog queries."
         ) from exc
 
-    logger.info("Using Euclid environment: %s", env)
-    euclid = EuclidClass(environment=env, show_server_messages=False)
-
     if not os.path.exists(credentials_file):
         logger.error("Credentials file not found: %s", credentials_file)
         sys.exit(-1)
 
-    logger.info("Logging in.")
+    logger.debug("Logging in to Euclid environment %s.", env)
+    euclid = EuclidClass(environment=env, show_server_messages=False)
     euclid.login(credentials_file=credentials_file, verbose=False)
-
-    with open(credentials_file, "r", encoding="utf-8") as f:
-        user = f.readline().strip()
-    logger.info("Logged in as %s", user)
-
     return euclid
 
 
@@ -228,27 +406,93 @@ def login_euclid(env, credentials_file):
 # =========================
 def is_finite(value):
     try:
-        if np.ma.isMaskedArray(value):
-            if value is np.ma.masked:
-                return False
-            value = value.filled(np.nan)
+        if value is np.ma.masked:
+            return False
         return math.isfinite(float(value))
     except Exception:
         return False
 
 
-def safe_name(value):
-    text = str(value).strip()
-    text = re.sub(r"[^A-Za-z0-9_.+-]+", "_", text)
-    return text or "target"
+def read_best_positions(args):
+    if not args.bestpos_csv:
+        return {}
+    if not os.path.exists(args.bestpos_csv):
+        logger.error("Best-position CSV not found: %s", args.bestpos_csv)
+        sys.exit(-1)
+
+    tab = Table.read(args.bestpos_csv, format="csv")
+    columns = [
+        args.bestpos_name_column,
+        args.bestpos_ra_column,
+        args.bestpos_dec_column,
+        args.bestpos_err_column,
+    ]
+    missing = [col for col in columns if col not in tab.colnames]
+    if missing:
+        logger.error("Best-position CSV is missing columns: %s", ", ".join(missing))
+        sys.exit(-1)
+
+    # first matching row wins, as in a linear search over the table
+    best = {}
+    for row in tab:
+        name = str(row[args.bestpos_name_column])
+        if name not in best:
+            best[name] = (
+                row[args.bestpos_ra_column],
+                row[args.bestpos_dec_column],
+                row[args.bestpos_err_column],
+            )
+    logger.info("Loaded %d best positions from %s", len(best), args.bestpos_csv)
+    return best
 
 
-def validate_identifier(identifier, label):
-    if identifier.lower() == "none":
-        return identifier
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", identifier):
-        raise ValueError(f"Invalid {label}: {identifier}")
-    return identifier
+# Files written by euclid_query.py: <YYYYmmdd_HHMMSS>_euclid_<kind>_<frame>.csv
+INPUT_CSV_RE = re.compile(r"^(\d{8}_\d{6})_euclid_(targets|query)_(.+)\.csv$")
+# Files this script writes into the same folder, never to be used as input
+OWN_OUTPUT_FRAMES = {"without_catalog"}
+
+
+def resolve_input_csv(path, frame_type=None):
+    """Return path itself if it is a file, else the latest target CSV in the folder.
+
+    Prefers the one-row-per-target *_euclid_targets_<frame>.csv and falls back
+    to the per-frame *_euclid_query_<frame>.csv if no targets file exists.
+    """
+    if os.path.isfile(path):
+        return path
+    if not os.path.isdir(path):
+        logger.error("CSV path not found: %s", path)
+        sys.exit(-1)
+
+    candidates = {"targets": [], "query": []}
+    for f in glob.glob(os.path.join(path, "*_euclid_*_*.csv")):
+        m = INPUT_CSV_RE.match(os.path.basename(f))
+        if m is None:
+            continue
+        stamp, kind, frame = m.groups()
+        if frame in OWN_OUTPUT_FRAMES:
+            continue
+        if frame_type is not None and frame != frame_type:
+            continue
+        candidates[kind].append((stamp, os.path.getmtime(f), f))
+
+    for kind in ("targets", "query"):
+        if candidates[kind]:
+            # Latest by timestamp prefix, mtime as tie-breaker
+            found = sorted(candidates[kind])
+            if len(found) > 1:
+                logger.info(
+                    "Found %d *_euclid_%s_*.csv files in %s, using the latest",
+                    len(found), kind, path,
+                )
+            return found[-1][2]
+
+    suffix = f" with frame type '{frame_type}'" if frame_type else ""
+    logger.error(
+        "No *_euclid_targets_*.csv or *_euclid_query_*.csv%s found in %s",
+        suffix, path,
+    )
+    sys.exit(-1)
 
 
 def read_targets(args):
@@ -264,327 +508,405 @@ def read_targets(args):
         logger.error("Found columns: %s", tab.colnames)
         sys.exit(-1)
 
-    keys = []
+    best_positions = read_best_positions(args)
+
     targets = []
-    for index, row in enumerate(tab):
-        if not is_finite(row[args.ra_column]) or not is_finite(row[args.dec_column]):
-            logger.warning("Skipping row %d with non-finite coordinates.", index)
+    seen = set()
+    for row in tab:
+        name = str(row[args.name_column])
+        if name in seen:
             continue
-
-        if args.target_id_column in tab.colnames:
-            key = str(row[args.target_id_column])
-        else:
-            key = (
-                str(row[args.name_column]),
-                round(float(row[args.ra_column]), 8),
-                round(float(row[args.dec_column]), 8),
-            )
-
-        if key in keys:
-            continue
-
-        keys.append(key)
-        pos_error = np.nan
-        if args.err_column in tab.colnames and is_finite(row[args.err_column]):
-            pos_error = float(row[args.err_column])
+        seen.add(name)
+        ra = row[args.ra_column]
+        dec = row[args.dec_column]
+        err = row[args.err_column] if args.err_column in tab.colnames else np.nan
+        if name in best_positions:
+            ra, dec, err = best_positions[name]
+            logger.debug("Using best position for %s.", name)
 
         targets.append(
             {
-                "target_oid": key if isinstance(key, str) else len(targets) + 1,
-                "name": str(row[args.name_column]),
-                "right_ascension": float(row[args.ra_column]),
-                "declination": float(row[args.dec_column]),
-                "pos_error": pos_error,
+                "name": name,
+                "ra": float(ra) if is_finite(ra) else np.nan,
+                "dec": float(dec) if is_finite(dec) else np.nan,
+                "err": float(err) if is_finite(err) else np.nan,
             }
         )
 
-    target_tab = Table(rows=targets)
-    logger.info("Loaded %d unique targets from %d CSV rows.", len(target_tab), len(tab))
-    return target_tab
+    if len(targets) < len(tab):
+        logger.info("Dropped %d duplicate rows for the same target name",
+                    len(tab) - len(targets))
+    logger.info("Loaded %d targets from %s", len(targets), args.csv)
+    return targets
+
+
+# =========================
+# Catalogue discovery
+# =========================
+def list_archive_tables(euclid):
+    tables = euclid.load_tables(only_names=True, verbose=False)
+    return {table.get_qualified_name().lower() for table in tables}
+
+
+def resolve_catalog(catalog, available):
+    """Pick the existing table for each entry of a catalogue configuration.
+
+    Entries may list several candidate names; the first one present in the
+    archive is used. Returns None if the MER catalogue itself is missing, and
+    sets joined tables that do not exist to None.
+    """
+    resolved = dict(catalog)
+    for key in ("table", *JOINED_TABLES):
+        candidates = catalog[key]
+        if isinstance(candidates, str):
+            candidates = (candidates,)
+        resolved[key] = next((t for t in candidates if t.lower() in available), None)
+        if resolved[key] is None:
+            logger.debug("%s: no %s among %s", catalog["specific_tier"], key, candidates)
+
+    if resolved["table"] is None:
+        return None
+    return resolved
+
+
+def resolve_catalogs(euclid):
+    """Return the deep and wide catalogues available in this environment."""
+    available = list_archive_tables(euclid)
+    deep = [c for c in (resolve_catalog(c, available) for c in DEEP_CATALOGS) if c]
+    wide = [c for c in (resolve_catalog(c, available) for c in WIDE_CATALOGS) if c]
+
+    for catalog in (*deep, *wide):
+        missing = [key for key in JOINED_TABLES if catalog[key] is None]
+        logger.info(
+            "Using %s%s",
+            catalog["table"],
+            f" (missing: {', '.join(missing)})" if missing else "",
+        )
+    if not deep and not wide:
+        raise RuntimeError("No MER catalogue tables found in this environment")
+    return deep, wide
 
 
 # =========================
 # Query construction
 # =========================
-def infer_morphology_table(catalog_table):
-    lower = catalog_table.lower()
-    schema = ""
-    table = lower
-    if "." in lower:
-        schema, table = lower.rsplit(".", 1)
-        schema += "."
-
-    if table.endswith("_deep") or "deep" in table:
-        return f"{schema}mer_morphology_deep"
-    if table.endswith("_wide") or "wide" in table:
-        return f"{schema}mer_morphology_wide"
-    return ""
+def validate_search_parameters(ra, dec, radius_deg):
+    values = (ra, dec, radius_deg)
+    if not all(isinstance(value, Real) and math.isfinite(value) for value in values):
+        raise ValueError("RA, Dec, and radius must be finite numbers")
+    if not 0.0 <= ra < 360.0:
+        raise ValueError("RA must be in the range [0, 360) degrees")
+    if not -90.0 <= dec <= 90.0:
+        raise ValueError("Dec must be in the range [-90, 90] degrees")
+    if radius_deg <= 0.0:
+        raise ValueError("Search radius must be greater than zero")
 
 
-def select_clause(use_all_columns, morphology_table):
-    if use_all_columns:
-        columns = ["cat.*"]
-    else:
-        columns = [f"cat.{col}" for col in CATALOG_COLUMNS]
-
-    if morphology_table:
-        columns.extend(f"morph.{col}" for col in MORPHOLOGY_COLUMNS)
-
-    columns.append(
-        "DISTANCE(cat.right_ascension, cat.declination, "
-        "{ra}, {dec}) AS sep_deg"
+def join_clause(catalog, key):
+    """LEFT JOIN on object_id, or an empty string if the table is missing."""
+    if not catalog[key]:
+        return ""
+    alias = JOINED_TABLES[key]
+    return (
+        f"LEFT JOIN {catalog[key]} AS {alias} "
+        f"ON cat.object_id = {alias}.object_id\n"
     )
-    return ",\n      ".join(columns)
 
 
-def build_catalog_query(ra, dec, radius_deg, catalog_table, morphology_table, use_all_columns):
-    select = select_clause(use_all_columns, morphology_table).format(ra=ra, dec=dec)
-    join = ""
-    if morphology_table:
-        join = f"""
-    JOIN
-      {morphology_table} AS morph
-    ON
-      cat.object_id = morph.object_id"""
+def build_catalog_query(catalog, ra, dec, radius_deg, columns=HOST_COLUMNS):
+    """Build an ADQL cone search for one catalogue."""
+    select_columns = [f"cat.{column}" for column in columns]
+    select_columns.extend(
+        (
+            f"'{catalog['survey_tier']}' AS survey_tier",
+            f"'{catalog['specific_tier']}' AS specific_tier",
+        )
+    )
+    where_clauses = [
+        (
+            "CONTAINS("
+            "POINT('ICRS', cat.right_ascension, cat.declination), "
+            f"CIRCLE('ICRS', {ra}, {dec}, {radius_deg})"
+            ") = 1"
+        ),
+        *catalog["filters"],
+    ]
+    joins = "".join(
+        join_clause(catalog, key) for key in ("morphology_table", "photo_z_table")
+    )
 
-    return f"""
-    SELECT
-      {select}
-    FROM
-      {catalog_table} AS cat{join}
-    WHERE
-      CONTAINS(
-        POINT('ICRS', cat.right_ascension, cat.declination),
-        CIRCLE('ICRS', {ra}, {dec}, {radius_deg})
-      ) = 1
-    """
+    return (
+        "SELECT\n    "
+        + ",\n    ".join(select_columns)
+        + f"\nFROM {catalog['table']} AS cat\n"
+        + joins
+        + "WHERE "
+        + "\n  AND ".join(where_clauses)
+    )
+
+
+def build_tier_query(catalogs, ra, dec, radius_deg, columns=HOST_COLUMNS):
+    """Combine the cone searches of one survey tier with UNION ALL."""
+    if not catalogs:
+        raise ValueError("At least one catalogue is required")
+    return "\n\nUNION ALL\n\n".join(
+        build_catalog_query(catalog, ra, dec, radius_deg, columns)
+        for catalog in catalogs
+    )
+
+
+def build_full_host_query(object_ids, catalog):
+    """Build an ADQL query joining catalogue, morphology and photo-z products."""
+    object_ids = pd.Series(object_ids).dropna().drop_duplicates()
+    try:
+        numeric_ids = pd.to_numeric(object_ids, errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("object_id values must be numeric") from exc
+
+    if numeric_ids.empty:
+        raise ValueError("At least one object_id is required")
+    if (numeric_ids % 1 != 0).any():
+        raise ValueError("object_id values must be integers")
+
+    id_list = ", ".join(str(int(object_id)) for object_id in numeric_ids)
+    # only select columns from tables that exist in this environment
+    aliases = {"cat"} | {
+        alias for key, alias in JOINED_TABLES.items() if catalog[key]
+    }
+    select_columns = (
+        *(col for col in FULL_HOST_COLUMNS if col.split(".", 1)[0] in aliases),
+        f"'{catalog['survey_tier']}' AS survey_tier",
+        f"'{catalog['specific_tier']}' AS specific_tier",
+    )
+    joins = "".join(join_clause(catalog, key) for key in JOINED_TABLES)
+
+    return (
+        "SELECT\n    "
+        + ",\n    ".join(select_columns)
+        + f"\nFROM {catalog['table']} AS cat\n"
+        + joins
+        + f"WHERE cat.object_id IN ({id_list})"
+    )
+
+
+# =========================
+# Query execution
+# =========================
+def execute_query(euclid, query, label, max_retries=3, retry_delay=5.0):
+    """Run an ADQL query with linearly increasing retry delays."""
+    if max_retries < 1:
+        raise ValueError("max_retries must be a positive integer")
+    if retry_delay < 0:
+        raise ValueError("retry_delay cannot be negative")
+
+    logger.debug("%s query:\n%s", label, query)
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            job = euclid.launch_job_async(query, verbose=False)
+            if job is None:
+                raise RuntimeError("archive returned no job")
+            return job.get_results().to_pandas()
+        except Exception as exc:
+            last_error = exc
+            if attempt == max_retries:
+                break
+
+            delay = attempt * retry_delay
+            logger.warning(
+                "%s query attempt %d/%d failed: %s; retrying in %.1f s",
+                label,
+                attempt,
+                max_retries,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"{label} query failed after {max_retries} attempts") from last_error
 
 
 def run_host_search(
-    euclid,
-    target,
-    catalog_table,
-    morphology_table,
-    radius_deg,
-    use_all_columns,
+    euclid, deep_catalogs, wide_catalogs, ra, dec, radius_deg, max_retries=3, retry_delay=5.0
 ):
-    query = build_catalog_query(
-        ra=target["right_ascension"],
-        dec=target["declination"],
-        radius_deg=radius_deg,
-        catalog_table=catalog_table,
-        morphology_table=morphology_table,
-        use_all_columns=use_all_columns,
-    )
-    logger.debug("Query for %s:\n%s", target["name"], query)
-    job = euclid.launch_job_async(query, verbose=False)
-    result = job.get_results()
-    logger.info(
-        "%s / %s: %d catalog rows.",
-        target["name"],
-        catalog_table,
-        len(result),
-    )
+    """Cone search on the deep catalogues, falling back to wide if empty."""
+    validate_search_parameters(ra, dec, radius_deg)
+
+    result = pd.DataFrame()
+    if deep_catalogs:
+        deep_query = build_tier_query(deep_catalogs, ra, dec, radius_deg)
+        result = execute_query(euclid, deep_query, "DEEP", max_retries, retry_delay)
+
+    if result.empty and wide_catalogs:
+        logger.info("No deep sources found; searching wide catalogues")
+        wide_query = build_tier_query(wide_catalogs, ra, dec, radius_deg)
+        result = execute_query(euclid, wide_query, "WIDE", max_retries, retry_delay)
+
+    logger.info("Host search returned %d rows", len(result))
     return result
 
 
-# =========================
-# Catalog post-processing
-# =========================
-def add_target_columns(tab, target, catalog_table):
-    nrows = len(tab)
-    tab["target_oid"] = np.full(nrows, str(target["target_oid"]), dtype="U128")
-    tab["target_name"] = np.full(nrows, str(target["name"]), dtype="U128")
-    tab["target_ra"] = np.full(nrows, float(target["right_ascension"]), dtype=float)
-    tab["target_dec"] = np.full(nrows, float(target["declination"]), dtype=float)
-    tab["target_pos_error"] = np.full(nrows, float(target["pos_error"]), dtype=float)
-    tab["catalog_table"] = np.full(nrows, str(catalog_table), dtype="U128")
-    return tab
+def get_full_host_data(euclid, catalogs, minimal_df, max_retries=3, retry_delay=5.0):
+    """Fetch full catalogue, morphology and photo-z data for candidate hosts."""
+    required_columns = {"object_id", "specific_tier"}
+    missing_columns = required_columns.difference(minimal_df.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"minimal_df is missing required columns: {missing}")
+    if minimal_df.empty:
+        return pd.DataFrame()
+
+    catalogs_by_tier = {catalog["specific_tier"]: catalog for catalog in catalogs}
+    results = []
+    for specific_tier, tier_df in minimal_df.groupby("specific_tier", sort=False):
+        if specific_tier not in catalogs_by_tier:
+            raise ValueError(f"Catalogue {specific_tier!r} not available in this environment")
+        query = build_full_host_query(tier_df["object_id"], catalogs_by_tier[specific_tier])
+        result = execute_query(euclid, query, specific_tier, max_retries, retry_delay)
+        if not result.empty:
+            results.append(result)
+
+    if not results:
+        return pd.DataFrame()
+    return pd.concat(results, ignore_index=True, sort=False)
 
 
-def add_separation_arcsec(tab):
-    if "sep_deg" in tab.colnames and "sep_arcsec" not in tab.colnames:
-        tab["sep_arcsec"] = np.array(tab["sep_deg"], dtype=float) * 3600.0
-    return tab
-
-
-def sort_table(tab, sort_by):
-    if len(tab) == 0 or sort_by not in tab.colnames:
-        return tab
-
-    values = np.array(tab[sort_by], dtype=float)
-    order = np.argsort(np.where(np.isfinite(values), values, np.inf))
-    return tab[order]
+def merge_host_data(minimal_df, full_df, target):
+    """Add the full host columns to the minimal result and tag the target."""
+    if len(full_df) > 0:
+        new_cols = [col for col in full_df.columns if col not in minimal_df.columns]
+        df = minimal_df.merge(
+            full_df[["object_id"] + new_cols], on="object_id", how="left"
+        )
+    else:
+        df = minimal_df.copy()
+    df["target_name"] = target["name"]
+    df["target_ra"] = target["ra"]
+    df["target_dec"] = target["dec"]
+    df["target_pos_error"] = target["err"]
+    return df
 
 
 # =========================
 # Output
 # =========================
-def write_target_catalog(tab, outdir, target_name, top_n):
-    target_dir = os.path.join(outdir, safe_name(target_name))
-    os.makedirs(target_dir, exist_ok=True)
-
-    full_path = os.path.join(target_dir, f"{safe_name(target_name)}_catalog.csv")
-    tab.write(full_path, format="csv", overwrite=True)
-
-    if top_n > 0 and len(tab) > top_n:
-        top_rows = tab[:top_n]
-        top_path = os.path.join(
-            target_dir,
-            f"{safe_name(target_name)}_catalog_top{top_n}.csv",
-        )
-        top_rows.write(top_path, format="csv", overwrite=True)
-    else:
-        top_path = full_path
-
-    logger.info("Saved target catalog: %s", full_path)
-    return full_path, top_path
-
-
-def target_missing_row(target, reason):
-    return {
-        "target_oid": str(target["target_oid"]),
-        "name": str(target["name"]),
-        "right_ascension": float(target["right_ascension"]),
-        "declination": float(target["declination"]),
-        "pos_error": float(target["pos_error"]),
-        "reason": reason,
-    }
-
-
-def make_outdir(base, ext):
-    dtime_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder = f"{dtime_str}_{ext}" if ext else dtime_str
-    outdir = os.path.join(base, folder)
-    os.makedirs(outdir, exist_ok=True)
-    return dtime_str, outdir
+def save_csv(df, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False)
+    logger.info("Saved %d rows to %s", len(df), path)
 
 
 # =========================
 # Main
 # =========================
+def process_target(args, target, outdir, radius_deg, deep_catalogs, wide_catalogs):
+    """Return the full host catalogue of one target, or None if there is none."""
+    # same folder layout as euclid_get_cutout.py, so catalogues sit next to the cutouts
+    name = str(target["name"])
+    target_dir = os.path.join(outdir, name)
+    catalog_path = os.path.join(target_dir, f"{name}_catalog.csv")
+    full_path = os.path.join(target_dir, f"{name}_catalog_full.csv")
+
+    if os.path.exists(full_path) and not (args.force_catalog or args.force_full):
+        logger.info("Full catalog for %s already exists. Reading it.", target["name"])
+        return pd.read_csv(full_path)
+
+    # sessions expire on long runs, so log in again for every target
+    euclid = login_euclid(args.env, args.credentials_file)
+
+    if os.path.exists(catalog_path) and not args.force_catalog:
+        logger.info("Catalog for %s already exists. Reading it.", target["name"])
+        minimal_df = pd.read_csv(catalog_path)
+    else:
+        minimal_df = run_host_search(
+            euclid,
+            deep_catalogs,
+            wide_catalogs,
+            ra=target["ra"],
+            dec=target["dec"],
+            radius_deg=radius_deg,
+            max_retries=args.max_retries,
+            retry_delay=args.retry_delay,
+        )
+        if len(minimal_df) > 0:
+            save_csv(minimal_df, catalog_path)
+
+    if len(minimal_df) == 0:
+        return None
+
+    full_df = get_full_host_data(
+        euclid,
+        deep_catalogs + wide_catalogs,
+        minimal_df,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+    )
+    df = merge_host_data(minimal_df, full_df, target)
+    save_csv(df, full_path)
+    return df
+
+
 def main():
     args = parse_args()
     logger.setLevel(getattr(logging, args.log_level.upper()))
 
-    catalog_tables = args.catalog_table or ["mer_catalogue_deep"]
-    catalog_tables = [
-        validate_identifier(table, "catalog table") for table in catalog_tables
-    ]
-
-    radius_deg = (args.radius_arcsec * u.arcsec).to_value(u.deg)
-    use_all_columns = args.columns == "all"
-    targets = read_targets(args)
-    euclid = login_euclid(args.env, args.credentials_file)
-    dtime_str, outdir = make_outdir(args.outpath, args.ext)
+    input_path = args.csv
+    args.csv = resolve_input_csv(input_path, args.frame_type)
+    if args.outdir:
+        outdir = args.outdir
+    elif os.path.isdir(input_path):
+        outdir = input_path
+    else:
+        outdir = os.path.dirname(os.path.abspath(args.csv))
+    os.makedirs(outdir, exist_ok=True)
     logger.info("Using output path: %s", outdir)
+
+    radius_deg = args.radius_arcsec / 3600.0
+    targets = read_targets(args)
+    deep_catalogs, wide_catalogs = resolve_catalogs(
+        login_euclid(args.env, args.credentials_file)
+    )
 
     combined = []
     missing_targets = []
-    for target in targets:
-        target_tables = []
-        query_failures = []
-        for catalog_table in catalog_tables:
-            if args.morphology_table.lower() == "none":
-                morphology_table = ""
-            elif args.morphology_table.lower() == "auto":
-                morphology_table = infer_morphology_table(catalog_table)
-            else:
-                morphology_table = validate_identifier(
-                    args.morphology_table, "morphology table"
-                )
-
-            try:
-                result = run_host_search(
-                    euclid=euclid,
-                    target=target,
-                    catalog_table=catalog_table,
-                    morphology_table=morphology_table,
-                    radius_deg=radius_deg,
-                    use_all_columns=use_all_columns,
-                )
-            except Exception as exc:
-                query_failures.append(f"{catalog_table}: {exc}")
-                logger.error(
-                    "%s / %s failed with morphology table '%s': %s",
-                    target["name"],
-                    catalog_table,
-                    morphology_table or "none",
-                    exc,
-                )
-                if morphology_table:
-                    logger.info(
-                        "Retrying %s / %s without morphology join.",
-                        target["name"],
-                        catalog_table,
-                    )
-                    try:
-                        result = run_host_search(
-                            euclid=euclid,
-                            target=target,
-                            catalog_table=catalog_table,
-                            morphology_table="",
-                            radius_deg=radius_deg,
-                            use_all_columns=use_all_columns,
-                        )
-                    except Exception as retry_exc:
-                        query_failures.append(f"{catalog_table} without morphology: {retry_exc}")
-                        logger.error(
-                            "%s / %s failed without morphology join: %s",
-                            target["name"],
-                            catalog_table,
-                            retry_exc,
-                        )
-                        continue
-                else:
-                    continue
-
-            result = add_target_columns(result, target, catalog_table)
-            result = add_separation_arcsec(result)
-            result = sort_table(result, args.sort_by)
-            if len(result) == 0:
-                continue
-            target_tables.append(result)
-
-        if not target_tables:
-            logger.warning("No catalog rows for target %s.", target["name"])
-            reason = "no_rows"
-            if query_failures:
-                reason = "query_failed; " + " | ".join(query_failures)
-            missing_targets.append(target_missing_row(target, reason))
+    for i, target in enumerate(targets):
+        logger.info("Processing %s... %d/%d", target["name"], i + 1, len(targets))
+        try:
+            df = process_target(
+                args, target, outdir, radius_deg, deep_catalogs, wide_catalogs
+            )
+        except Exception as exc:
+            logger.error("%s failed: %s", target["name"], exc)
+            missing_targets.append({**target, "reason": f"query_failed; {exc}"})
             continue
 
-        target_catalog = vstack(target_tables, metadata_conflicts="silent")
-        target_catalog = sort_table(target_catalog, args.sort_by)
-        write_target_catalog(target_catalog, outdir, target["name"], args.top_n)
-        combined.append(target_catalog)
+        if df is None:
+            logger.warning("No catalog found for %s.", target["name"])
+            missing_targets.append({**target, "reason": "no_rows"})
+            continue
+        combined.append(df)
 
-    if combined and not args.no_combined:
-        combined_tab = vstack(combined, metadata_conflicts="silent")
-        combined_tab = sort_table(combined_tab, args.sort_by)
-        combined_path = os.path.join(outdir, f"{dtime_str}_euclid_host_catalog.csv")
-        combined_tab.write(combined_path, format="csv", overwrite=True)
-        logger.info("Saved combined catalog: %s", combined_path)
+    dtime_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if combined:
+        combined_df = pd.concat(combined, ignore_index=True, sort=False)
+        save_csv(combined_df, os.path.join(outdir, f"{dtime_str}_euclid_host_catalog.csv"))
 
-    missing_path = os.path.join(outdir, f"{dtime_str}_euclid_targets_without_catalog.csv")
+    missing_df = pd.DataFrame(
+        missing_targets, columns=["name", "ra", "dec", "err", "reason"]
+    )
+    save_csv(missing_df, os.path.join(outdir, f"{dtime_str}_euclid_targets_without_catalog.csv"))
+
+    logger.info(
+        "Finished processing %d targets. Found catalogs for %d, no catalogs for %d.",
+        len(targets),
+        len(combined),
+        len(missing_targets),
+    )
     if missing_targets:
-        missing_tab = Table(rows=missing_targets)
-    else:
-        missing_tab = Table(
-            names=("target_oid", "name", "right_ascension", "declination", "pos_error", "reason"),
-            dtype=("U128", "U128", float, float, float, "U512"),
-        )
-    missing_tab.write(missing_path, format="csv", overwrite=True)
-    logger.info("Saved %d targets without catalog rows to %s", len(missing_tab), missing_path)
+        logger.info("Targets without catalogs: %s", [t["name"] for t in missing_targets])
 
-    with open(os.path.join(outdir, f"{dtime_str}.log"), "w", encoding="utf-8") as f:
+    with open(os.path.join(outdir, f"{dtime_str}_get_catalog.log"), "w", encoding="utf-8") as f:
         f.write(log_buffer.getvalue())
-
-    if args.copy_input:
-        shutil.copy(args.csv, outdir)
-        logger.info("Copied input CSV to %s", outdir)
-
-    logger.info("Finished successfully.")
 
 
 if __name__ == "__main__":
